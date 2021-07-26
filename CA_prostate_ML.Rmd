@@ -1,0 +1,3175 @@
+---
+title: "ML Classification for prostate cancer recurrence"
+author: "Briha Ansari"
+date: "6/21/2021"
+output: html_document
+---
+
+
+Approximately quarter a million men are estimated to develop prostate cancer in the US. While majority of patients are diagnosed with localized disease, 1 in 3 patients are still at risk for developing recurrence within ten years after their initial treatment [[1]](#1) [[2]](#2) [[3]](#3) [[4]](#4). Current clinical scores based on TNM staging, tumor grade, PSA levels, and % cancer cells on biopsy can help predict the future risk of recurrence[[5]](#5). Improved prediction models can guide clinical decision-making in patients at high risk for recurrence. Integrating these clinical parameters with multi-omic data in a comprehensive risk prediction model will provide a more personalized recurrence risk score and advance precision medicine. Moreover, it will add deeper insight into the molecular underpinnings of prostate cancer recurrence. This .RMD provides a workflow for the development of a WebApp that uses The Cancer Genome Atlas curated data and machine learning classification models in the back-end to predict prostate cancer recurrence risk. 
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+library(curatedTCGAData)
+library(MultiAssayExperiment)
+library(TCGAutils)
+library(tidyverse)
+library(ggplot2)
+library(tidymodels)
+library(ranger)
+library(discrim)
+library(preprocessCore)
+library(ISLR)
+library(ggfortify)
+library(DALEX)
+library(DALEXtra)
+library(pca3d)
+library(kableExtra)
+library(vip)
+
+```
+
+
+#BiocManager::install("TCGAutils")
+
+
+
+##############DATA PREPROCESSING###############################
+
+check disease codes in curatedTCGA data
+
+```{r}
+ 
+# data('diseaseCodes', package = "TCGAutils")
+# head(diseaseCodes)
+# diseaseCodes
+
+
+```
+We are interested in Prostate Cancer cases only, so we will check assays available for prostate cancer
+
+```{r}
+#data source
+   curatedTCGAData(
+    diseaseCode = "PRAD", assays = "*", version = "2.0.1"   )
+```
+
+keep  summarized experiments of interest
+
+```{r}
+prad <- suppressMessages(curatedTCGAData("PRAD",
+                                         c("RPPAArray","miRNASeqGene","RNASeq2GeneNorm","Mutation"),
+                                         dry.run=FALSE,version="2.0.1"))  
+  
+```
+
+confirm assay names
+
+```{r}
+
+names(assays(prad))
+
+```
+
+
+Now we have the following assays in patients with Prostate cancer: 
+
+1.RNASeq2GeneNorm: Upper quartile normalized RSEM TPM geneexpression values
+2.miRNASeqGene:Gene-level log2 RPM miRNA expressionvalues
+3.RPPAArray:Reverse Phase Protein Array normalizedprotein expression values
+4.Mutation:Somatic mutations calls
+### SY: RNASeq2GeneNorm is not in log2, but, miRNASeqGene is in log2
+###     It is better to take log2 of RNASeq2GeneNorm 
+
+
+check the type of samples by sampletables() Below are the codes for each sample type
+
+#> Code Definition Short.Letter.Code
+#> 1 01 Primary Solid Tumor TP
+#> 2 02 Recurrent Solid Tumor TR
+#> 3 03 Primary Blood Derived Cancer - Peripheral Blood TB
+#> 4 04 Recurrent Blood Derived Cancer - Bone Marrow TRBM
+#> 5 05 Additional - New Primary TAP
+#>6 06 Metastatic TM
+```{r}
+
+
+#sampleTables(prad)
+```
+01 
+
+We will keep samples and assays from primary tumors only
+```{r}
+
+prad <- TCGAprimaryTumors(prad)
+```
+
+recheck to see that we now have only primary tumor samples
+```{r}
+
+sampleTables(prad)
+
+```
+All assays so 01, so we have primary tumors only now 
+Creating objects for each type of assay in our dataset
+```{r}
+#MiRNA
+# mir <- assays(prad)[["PRAD_miRNASeqGene-20160128"]]
+# head(mir[,1:5])
+# 
+# #Proteomics
+# prot <- assays(prad)[["PRAD_RPPAArray-20160128"]]
+# head(prot[,1:5])
+# 
+# #Mutation
+# mut <- assays(prad)[["PRAD_Mutation-20160128"]]
+# head(mut[,1:20])
+# 
+# #RNA seq
+# rna <- assays(prad)[["PRAD_RNASeq2GeneNorm-20160128"]]
+# head(rna[,1:20])
+
+```
+
+
+
+Now explore clinical data, coldata() has phenotype data
+
+```{r}
+
+pheno1 <- colData(prad)
+```
+
+check sample size of phenotype data
+```{r}
+
+dim(pheno1)
+
+```
+There are 498 observations, the sample size will decrease later when we subset to data that has response values (yes,no) for recurrence 
+
+check each variable of interest 
+```{r}
+
+names(pheno1)
+# 
+# 
+# #recurrence are colnames 216,186,159
+# table(pheno1[,216])
+# table(pheno1[,186])
+# table(pheno1[,159])
+
+# # progression 193,164
+# table(pheno1[,193])
+# table(pheno1[,164])
+# 
+# # primary therapy outcome success 161
+# table(pheno1[,161])
+
+
+```
+
+
+We will proprocess data to keep observations with documented recurrence using column [186] "patient.follow_ups.follow_up.new_tumor_event_after_initial_treatment", we will also remove cases if pathology_T_stage is NA
+
+```{r}
+
+#reference: Shraddha Pai
+
+staget <- sub("[abcd]","",sub("t","",colData(prad)$pathology_T_stage))
+staget <- suppressWarnings(as.integer(staget))
+colData(prad)$STAGE <- staget
+tmp <- colData(prad)$patient.follow_ups.follow_up.new_tumor_event_after_initial_treatment 
+str(tmp)
+
+#create iDX vector for responses
+
+idx <-which(tmp %in% c("yes","no"))
+stagetna<-  which(is.na(staget))
+
+
+length(idx)
+length(stagetna)
+pID <- colData(prad)$patientID
+
+# keep IDs that have yes or no for recurrence - NAs for stage(T)
+tokeep <- setdiff (pID[idx], pID[stagetna]) 
+length(tokeep)
+prad <- prad[,tokeep,]
+pam50 <- colData(prad)$patient.follow_ups.follow_up.new_tumor_event_after_initial_treatment 
+
+
+### where a patient has multiple instances of the same assay
+### just keep the first instance encountered
+smp <- sampleMap(prad)
+expr <- assays(prad)
+for (k in 1:length(expr)) {
+  samps <- smp[which(smp$assay==names(expr)[k]),]
+  notdup <- samps[which(!duplicated(samps$primary)),"colname"]
+  #message(sprintf("%s: %i notdup", names(expr)[k], length(notdup)))
+  prad[[k]] <- suppressMessages(prad[[k]][,notdup])
+}
+
+
+### create ID, STATUS columns, remove spaces/hyphens from patient labels
+pID <- colData(prad)$patientID
+colData(prad)$ID <- pID
+colData(prad)$STATUS <- pam50
+colData(prad)$STATUS <- gsub(" ",".",colData(prad)$STATUS)
+colData(prad)$STATUS <- gsub("-",".",colData(prad)$STATUS)
+
+
+
+```
+
+Creating subset of phenotype data for cohort of interest, we will call this pheno2
+```{r}
+
+# subset phenotype data to 
+pheno2 <- colData(prad) 
+head(pheno2[,c("ID","STATUS")])
+dim(pheno2)
+
+table(pheno2$STATUS)
+table(pheno2$STATUS,useNA="always") 
+```
+
+
+After data processsing, PRAD is now a subset of prostate cancer cases [AND] primary cancer samples [AND] with responses for recurrence (yes,no) only
+Creating subset of omics data for cohort of interest i.e preprocessed PRAD data obtained from the above code
+```{r}
+
+mir.subset <- assays(prad)[["PRAD_miRNASeqGene-20160128"]]
+
+
+prot.subset <- assays(prad)[["PRAD_RPPAArray-20160128"]]
+
+rna.subset <- assays(prad)[["PRAD_RNASeq2GeneNorm-20160128"]]
+
+
+mut.subset <- assays(prad)[["PRAD_Mutation-20160128"]]
+
+
+#CHeck dimension for each assy
+dim(mir.subset)
+
+dim(prot.subset)
+
+dim(rna.subset)
+
+dim(mut.subset)
+```
+
+Note that NOT all assays are available for all the patients in our data i.e we have 395 patients in the PRAD dataset but have 393 Mir assays, we will consider this when merging columns with phenotype data and removing NAs
+
+
+
+We will now subset Phenotype data to variables of our interest. There are 1147 variables, we will use domain knowledge and literature search and Machine learning to keep phenotype information predictive of recurrence
+
+read in data
+```{r}
+
+dim(pheno2)
+
+#convert to DF
+pheno3 <- as.data.frame(pheno2)
+
+#names(pheno3)
+
+## Remove columns with any NA
+## Remove columns with any NA
+#SY: pheno2 => pheno3
+#pheno3 <- pheno3[, which(colMeans(!is.na(pheno2)) >= 1)]
+pheno3 <- pheno3[, which(colMeans(!is.na(pheno3)) >= 1)]
+dim(pheno3)
+
+#recheck if all missing data has been removed
+#list rows of data that have missing values
+pheno3[!complete.cases(pheno2),]
+```
+
+
+After removing missing data, we are now from 1147 to 252 variables in Phenotype data
+```{r}
+#str(pheno2)
+
+#table(pheno3$STATUS)
+
+# reformat STATUS outcome to as.factor
+class(pheno3$STATUS)
+
+pheno3 <- pheno3 %>% 
+  mutate (STATUS = as_factor(STATUS)) 
+
+class(pheno3$STATUS)
+
+#names(pheno3) 
+
+
+```
+
+
+Remove clinically meaningless variables
+```{r}
+
+delt <- c(9:15,17:20,28:35,39:45,50:48,61:65,75:249)
+
+pheno4 <- pheno3 %>% 
+  select(-delt)
+
+
+#names (pheno4)
+# some more to delete
+delt2 <- c(8,22,24:33:38)
+pheno4 <- pheno4 %>% 
+  select(-delt2)
+
+```
+
+create csv file with clinically meaningless variable for the supplementary section 
+```{r}
+# clinically_meaningless <- pheno3 %>% 
+#   select (delt) %>% 
+#   select(delt2)
+# 
+# write.csv(clinically_meaningless,"clinically_meaningless.csv")
+```
+
+check structure of pheno4 for reformatting
+```{r}
+
+str(pheno4)
+
+names(pheno4)
+
+dim(pheno4)
+```
+
+
+reformat phenotype data (pheno4) variable to the correct format
+
+```{r}
+
+factr <- c(1:6,12:18,20,21,24,26)
+
+num <- c(7:11,19,22:23)
+
+pheno5 <- pheno4 %>% 
+  mutate_at(factr, factor) %>% 
+  mutate_at(num, as.numeric)
+
+str(pheno5)
+
+```
+
+lets get a baseline table for available features before processing phenotype data further, first get IDs from Mirna data, since we dont want pheno observations that has missing records in MiRNA
+
+http://www.danieldsjoberg.com/gtsummary/
+```{r}
+
+#remotes::install_github("ddsjoberg/gtsummary")
+
+library(kableExtra)
+library(gtsummary)
+library(table1)
+#get ids from Mirna data 
+
+tran_mir <- t(mir.subset)
+
+
+
+
+# ID column [,1] does not have header
+
+
+# convert to dataframe to  add header
+tran_mir <- as.data.frame(tran_mir)
+
+#colnames(tran_mir)
+
+
+#str(tran_mir)
+
+#create patientID column to merge later
+#rownames(tran_mir)
+
+# Add header
+tran_mir$patientID = rownames(tran_mir)
+
+# recheck if patient id header was added
+head(tran_mir$patientID)
+
+```
+
+Merge pheno and MiRNa data (left join by PatientID)
+```{r}
+
+
+#check str of IDs
+str(pheno5$patientID) 
+str(tran_mir$patientID)
+
+```
+
+```{r}
+#substring ID to keep them consistent across datasets for merging 
+tran_mir$patientID <- substr(tran_mir$patientID,start=1,stop=12)
+```
+
+
+```{r}
+#get ID column from MiRNA data
+t.id <- tran_mir[,1046:1047]
+
+```
+
+```{r}
+#subset pheno6 to samples available in MiRNA
+final.pheno <- left_join(pheno5, t.id, by = "patientID")
+```
+
+#remove NAs rows generated due to missing miRNA
+
+```{r}
+final.pheno <- final.pheno %>% 
+  drop_na("hsa-mir-99b")
+
+```
+
+
+create baseline table
+```{r}
+final1 <- final.pheno
+
+str(final1)
+
+
+final1$STATUS <-
+  factor(final1$STATUS,
+         levels=c("no","yes"),
+         labels=c("No recurrence", # Reference
+                  "Recurrence"))
+
+label(final1$patient.age_at_initial_pathologic_diagnosis)="Age"
+label(final1$patient.stage_event.gleason_grading.gleason_score)="Gleason Score"
+label(final1$patient.clinical_cqcf.history_of_prior_malignancy)="History of prior malignancy"
+label(final1$patient.biospecimen_cqcf.tumor_samples.tumor_sample.tumor_necrosis_percent) = "Tumor sample necrosis percent"
+label(final1$patient.biospecimen_cqcf.tumor_samples.tumor_sample.tumor_nuclei_percent)="Tumor nuclei percent"
+label(final1$STAGE) = "Stage"
+label(final1$histological_type) = "Histological type"
+label(final1$patient.clinical_cqcf.history_of_neoadjuvant_treatment) = "History of neoadjuvant treatment"
+
+
+trial2 =
+  final1 %>%
+  select(STATUS,patient.age_at_initial_pathologic_diagnosis,patient.stage_event.gleason_grading.gleason_score,patient.clinical_cqcf.history_of_prior_malignancy,patient.biospecimen_cqcf.tumor_samples.tumor_sample.tumor_nuclei_percent,patient.clinical_cqcf.history_of_neoadjuvant_treatment,patient.biospecimen_cqcf.tumor_samples.tumor_sample.tumor_necrosis_percent,histological_type,STAGE)
+
+
+
+table2 <- 
+  tbl_summary(
+    trial2,
+    by = STATUS, # split table by group
+    missing = "no" # don't list missing data separately
+  )%>%
+  add_n() %>% # add column with total number of non-missing observations
+  add_p() %>% # test for a difference between groups
+  modify_header(label = "**Variable**") %>% # update the column header
+  bold_labels() 
+
+table2
+
+```
+
+
+
+```{r}
+
+# Frequency with proportion axis, smoothed
+ggplot(data = final.pheno, mapping = aes(x = patient.age_at_initial_pathologic_diagnosis, y = after_stat(density), fill = STATUS)) +
+  geom_density(size = 2, alpha = 0.4)+
+  labs(title = "Proportional, smoothed with geom_density()")
+
+```
+
+
+
+
+cotinue working on pheno5 for feature selection
+```{r}
+#drop  unused ID and 1 factor level variables, they offer no variance and will affect predictive performance of the model
+
+onelevl <- c("ID","tumor_tissue_site","gender","patient.clinical_cqcf.history_of_neoadjuvant_treatment","patient.clinical_cqcf.tumor_type","patient.gender","patient.history_of_neoadjuvant_treatment")
+
+pheno6 <- select(pheno5,-onelevl)
+
+length(onelevl)
+ 
+dim(pheno6)
+
+str(pheno6)
+
+```
+
+create csv file with zero variance for supplementary
+
+```{r}
+# zero_variance <- pheno5 %>% 
+#   select(onelevl)
+# 
+# 
+# 
+# #write.csv(zero_variance,"zero_variance.csv")
+```
+
+Phenotype data (pheno6) is now ready to be preprocessed further and used in ML models, the goal is to obtain the best predictors which can be later merged with omics data  
+
+
+split pheno6 to keep aside IDs for held out test set(test.pheno)
+
+
+```{r}
+
+split1 <- pheno6 %>%
+  initial_split(prop = 0.8, strata = STATUS)
+train.pheno <- training(split1)
+test.pheno <- testing(split1)
+
+```
+
+read in data and remove patient ID column
+
+```{r}
+
+
+dat.pheno <- train.pheno[,-1]
+
+```
+check str
+```{r}
+
+str(dat.pheno)
+
+table(dat.pheno$STATUS)
+
+```
+
+## split data, we will make two splits here, 1 split to keep test data aside and other split to do the analysis 
+```{r}
+set.seed(525)
+
+
+
+
+pheno_split <- dat.pheno %>%
+  initial_split(prop = 0.8, strata = STATUS)
+pheno_train <- training(pheno_split)
+pheno_test <- testing(pheno_split)
+#
+# library(lares)
+# corr_cross(dat.pheno)
+
+```
+
+
+
+```{r}
+pheno_recipe <- recipe(STATUS ~ ., data = pheno_train) %>% # set formula
+  step_normalize(all_numeric_predictors()) %>%  # normalize
+  step_dummy(all_nominal_predictors(),- all_outcomes()) %>% # one hot encoding for binary predictors
+  step_upsample(STATUS, over_ratio = 1) %>% # upsample to address class imbalance
+  step_nzv(all_predictors()) %>% # remove near zero variance predictors
+  step_zv(all_predictors()) %>% #remove zero variance predictors
+  step_corr(all_predictors()) %>%  # remove one from  correlated variables
+  prep()
+pheno_recipe
+
+```
+
+#to get insight into how the data was handled
+```{r}
+ 
+# pheno_prep <- prep(pheno_recipe)
+# pheno_prep
+
+```
+
+
+```{r}
+# preprocess_removed <- prep(pheno_recipe, training = pheno_train)
+# 
+# tidy(preprocess_removed)
+```
+
+create supplementary material to show 
+```{r}
+# #nzv removed
+# pheno_nzv <- tidy(preprocess_removed, number=4) 
+# 
+# write.csv(pheno_nzv,"pheno_nzv.csv")
+# 
+# # zv removed
+# pheno_zv <- tidy(preprocess_removed, number=5) 
+# 
+# write.csv(pheno_zv,"pheno_zv.csv")
+# 
+# #correlated removed
+# 
+# pheno_corr <- tidy(preprocess_removed, number=6) 
+# 
+# write.csv(pheno_corr,"pheno_corr.csv")
+
+```
+
+look at output data after preprocessing
+```{r}
+# pheno_train_baked <- bake(pheno_recipe, NULL)
+# pheno_test_baked <- bake(pheno_recipe, new_data = pheno_test)
+# table(pheno_train_baked$STATUS)
+# table(pheno_test_baked$STATUS)
+```
+No class imbalance after upsample
+
+<!-- ## random forest -->
+
+<!-- ### model specification and workflow creation -->
+```{r}
+
+#model specification
+rf <- rand_forest(mtry = tune(),
+                  trees = tune(),
+                  min_n = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("ranger",importance = 'impurity')
+#workflow creation
+rf_wf <-
+  workflow() %>%
+  add_model(rf) %>%
+  add_recipe(pheno_recipe)
+```
+
+
+### prepare for hyperparameter tuning
+```{r}
+#specificy hyperparameters
+rf_grid <- grid_regular(mtry(range = c(5L,15L)),
+                        min_n(range = c(5, 10)),
+                        trees(range = c(1000L, 2000L)),
+                                                     levels = 2)
+
+#specify cross validation folds
+set.seed(525)
+pheno_folds <- vfold_cv(pheno_train, v = 10, repeats = 1)
+```
+
+
+### train and tune model (with tune_grid)
+```{r}
+doParallel::registerDoParallel(cores = 5) # specify cores for Cross validation parallel programming
+metrics = metric_set(roc_auc,accuracy,sens,spec,mcc) # set metrics
+rf_res <-
+  rf_wf %>%
+  tune_grid(
+    resamples = pheno_folds,
+    grid = rf_grid,
+    metrics = metrics,
+    control = control_grid(save_pred = TRUE)
+    )
+doParallel::stopImplicitCluster()
+foreach::registerDoSEQ()
+```
+
+
+### evaluate the models
+```{r}
+rf_res %>%
+  collect_metrics() %>%
+  ggplot(aes(x = mtry, y = mean, color = .metric)) +
+  geom_point() +
+  geom_line() + ylab("") +
+  facet_wrap(~trees + min_n) +
+  ggtitle(label = "model performance",
+          subtitle = "random forest")
+
+rf_best <- rf_res %>% # choose best model using select_best ()
+  select_best(metric = "roc_auc")
+
+#show model with the best AUC
+top_models <-
+  rf_res %>% 
+  show_best("roc_auc", n = 3) 
+top_models
+
+rf_auc <-
+  rf_res %>%
+  collect_predictions(parameters = rf_best) %>%
+  roc_curve(truth = STATUS, estimate = .pred_no) %>%
+  mutate(model = "random forest")
+autoplot(rf_auc)
+
+
+```
+
+### create workflow and fit the best mode,
+```{r}
+
+set.seed(567)
+final_rf_wf <-
+  rf_wf %>%
+  finalize_workflow(parameters = rf_best)
+#saveRDS(final_rf_wf,file="final_rf_wf.RDS")
+
+final_rf_fit <-
+  final_rf_wf %>%
+  last_fit(pheno_split,
+           metrics = metrics) # fit the best model and the workflow to test data, pheno split object has test data
+
+
+final_rf_fit %>%
+  collect_metrics()
+final_rf_fit %>%
+  collect_predictions() %>%
+  roc_curve(truth = STATUS, estimate = .pred_no) %>%
+  autoplot()
+```
+
+
+## logistic regression
+
+### model specification and workflow creation
+```{r}
+log_reg <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_mode(mode = "classification") %>%
+  set_engine(engine = "glmnet")
+lr_wf <- workflow() %>%
+  add_recipe(pheno_recipe) %>%
+  add_model(log_reg)
+```
+
+
+### prepare for hyperparameter tuning
+```{r}
+lr_param <- parameters(log_reg)
+lr_grid <- grid_regular(penalty(), mixture(), levels = 3)
+set.seed(525)
+pheno_folds <- vfold_cv(pheno_train, v = 10, repeats = 1)
+```
+
+
+### train and tune model (with tune_grid)
+```{r}
+parallel::detectCores(logical = FALSE)
+doParallel::registerDoParallel(cores = 5)
+metrics = metric_set(roc_auc,accuracy,sens,spec,mcc)
+lr_res <-
+  lr_wf %>%
+  tune_grid(
+    resamples = pheno_folds,
+    grid = lr_grid,
+metrics = metrics,
+    control = control_grid(save_pred = TRUE)
+    )
+doParallel::stopImplicitCluster()
+foreach::registerDoSEQ()
+```
+
+### evaluate the models
+```{r}
+lr_res %>%
+  collect_metrics() %>%
+  ggplot(aes(x = penalty, y = mean, color = .metric)) +
+  geom_point() +
+  geom_line() + ylab("") +
+  facet_wrap(~mixture) +
+  scale_x_log10(labels = scales::label_scientific()) +
+  ggtitle(label = "model performance",
+          subtitle = "logistic regression")
+lr_best <- lr_res %>%
+  select_best(metric = "roc_auc")
+lr_auc <-
+  lr_res %>%
+  collect_predictions(parameters = lr_best) %>%
+  roc_curve(truth = STATUS, estimate = .pred_no) %>%
+  mutate(model = "Logistic Regression")
+autoplot(lr_auc)
+
+top_models <-
+  lr_res %>% 
+  show_best("roc_auc", n = 3) 
+top_models
+
+lr_best
+```
+
+
+### create workflow and fit the best model,
+```{r}
+
+set.seed(567)
+final_lr_wf <-
+  lr_wf %>%
+  finalize_workflow(parameters = lr_best)
+#saveRDS(final_lr_wf,file="final_rf_wf.RDS")
+
+final_lr_fit <-
+  final_lr_wf %>%
+  last_fit(pheno_split,
+           metrics = metrics) # fit the best model and the workflow to test data, pheno split object has test data
+
+
+final_lr_fit %>%
+  collect_metrics()
+final_lr_fit %>%
+  collect_predictions() %>%
+  roc_curve(truth = STATUS, estimate = .pred_no) %>%
+  autoplot()
+```
+
+
+
+
+check consistency of best predictors using random forest and logistic regression
+
+random forest
+```{r}
+final_rf_fit %>%
+  pluck(".workflow", 1) %>%
+  pull_workflow_fit() %>%
+  vip(num_features = 20)
+
+```
+logistic regression
+```{r}
+final_lr_fit %>%
+  pluck(".workflow", 1) %>%
+  pull_workflow_fit() %>%
+  vip(num_features = 20)
+
+```
+
+
+
+we will select most important predictors, STATUS and IDs
+```{r}
+predictors <- c("patientID","STATUS","patient.stage_event.gleason_grading.gleason_score","patient.clinical_cqcf.gleason_score_secondary","patient.clinical_cqcf.gleason_score_primary","patient.age_at_initial_pathologic_diagnosis","patient.biospecimen_cqcf.tumor_samples.tumor_sample.tumor_necrosis_percent","patient.clinical_cqcf.gleason_score_combined")
+
+```
+
+create traing pheno data
+```{r}
+train.pheno <- as.data.frame(train.pheno) %>% 
+   select(predictors)
+```
+
+we now have phenotype data:
+train.pheno: With only the important predictors to be merged with training mirna data
+
+
+merge MiRNA dataset with status and ID, but also create a seperate held out mirna data  mirna and RNA dataset towards the end
+```{r}
+
+
+ 
+#transpose MiRNA data
+tmir <- t(mir.subset)
+
+
+# ID column [,1] does not have header
+tmir[,1]
+
+
+class(tmir)
+
+# convert to dataframe to  add header
+tmir1 <- as.data.frame(tmir)
+
+#colnames(tmir1)
+
+
+#str(tmir1)
+
+#create patientID column to merge later
+#rownames(tmir1)
+
+# Add header
+tmir1$patientID = rownames(tmir1)
+
+# recheck if patient id header was added
+#tmir1$patientID
+
+```
+
+
+
+
+
+
+Merge pheno and MiRNa data (inner join by PatientID)
+```{r}
+
+
+#check str of IDs
+str(train.pheno$patientID) 
+str(tmir1$patientID)
+
+```
+
+```{r}
+#substring ID to keep them consistent across datasets for merging 
+tmir1$patientID <- substr(tmir1$patientID,start=1,stop=12)
+```
+
+Merge datasets to create held out MiRNA plus phenotype data
+
+```{r}
+
+held_out.phenmir <- inner_join(test.pheno, tmir1, by = "patientID")
+
+```
+
+
+Merge datasets to create training MiRNA plus phenotype data with important predictors
+```{r}
+combined.mir <- inner_join(train.pheno, tmir1, by = "patientID")
+
+```
+remove if a row has NAs across all columns, since miRNA data was not available for all the patients, will remove any NAs 
+```{r}
+combined.mir1 <- na.omit(combined.mir)
+
+dim(combined.mir1)
+```
+
+
+Reformat and prepare data for Exploratory data analysis and ML models
+```{r}
+str(combined.mir1)
+
+
+#change outcome to as.factor
+combined.mir1$STATUS <- as.factor(combined.mir1$STATUS)
+
+
+table(combined.mir1$STATUS)
+
+
+```
+
+
+
+merge RNA dataset with status and ID
+```{r}
+#transpose RNA data
+trna <- t(rna.subset)
+
+
+# ID column [,1] does not have header
+trna[,1]
+
+
+class(trna)
+
+# convert to dataframe to  add header
+trna1 <- as.data.frame(trna)
+
+#colnames(rna)
+
+
+#str(trna)
+
+# #create patientID column to merge later
+#rownames(trna1)
+# 
+# # Add header
+trna1$patientID = rownames(trna1)
+
+# recheck if patient id header was added
+#trna1$patientID
+
+```
+
+
+```{r}
+#substring ID to keep them consistent across datasets for merging 
+trna1$patientID <- substr(trna1$patientID,start=1,stop=12)
+```
+
+Merge datasets to create held out MiRNA plus phenotype plus rna combined data
+
+```{r}
+
+combined_held_out <- inner_join(held_out.phenmir, trna1, by = "patientID")
+
+```
+
+
+Merge datasets to create training MiRNA plus phenotype data with important predictors
+```{r}
+combined.rna <- inner_join(train.pheno, trna1, by = "patientID")
+
+```
+
+RNA and pheno data both have 395 observation, so no missing data 
+```{r}
+combined.trna1 <- na.omit(combined.rna)
+dim(combined.rna)
+```
+
+
+################ combined_held_out:merged 20% pheno ID with MIRNA and RNA set to create a heldout set to be tested in the end#############
+#################################################################################################################
+
+
+Reformat and prepare RNA data  for Exploratory data analysis and ML models
+```{r}
+
+ 
+# #change outcome to as.factor
+combined.rna$STATUS <- as.factor(combined.rna$STATUS)
+
+
+#save data
+#save(combined.rna, file="combined.rna.rda")
+
+
+```
+
+check RNA data size
+```{r}
+
+Cstack_info()
+
+lobstr::obj_size(combined.rna)
+```
+
+
+
+<!-- Run PCA on combined Pheno and MiRNA data to see clustering -->
+
+<!-- ```{r} -->
+
+#combined.mir1 <- combined.mir1[,-1] #remove id column
+<!-- combined.mir.hc <- combined.mir1 -->
+<!-- ``` -->
+
+
+<!-- ```{r} -->
+<!-- str(combined.mir.hc) -->
+
+<!-- class(combined.mir.hc) -->
+<!-- ``` -->
+
+
+<!-- log tranform for PCA, add 1 to address zeros -->
+<!-- ```{r} -->
+
+<!-- # test[,2:1047] <- 1+(test[,2:1047]) -->
+<!-- #  -->
+<!-- # test[,2:1047] <- log(test[,2:1047],2) -->
+
+<!-- ``` -->
+
+<!-- tsne -->
+<!-- ```{r} -->
+
+<!-- library(Rtsne) -->
+<!-- data9 <- combined.mir1 -->
+
+<!-- df <- data9[,2:1052] -->
+
+<!-- df1 <- normalize.quantiles(as.matrix(df)) -->
+
+<!-- #create tsne object, perplexity should be less than observations,we need to tune perplerxity and max_iter -->
+<!-- tsne <- Rtsne(df, perplexity=125,verbose=FALSE, max_iter = 10000, check_duplicates= FALSE) -->
+
+<!-- plot(tsne$Y) -->
+
+<!-- #add colors -->
+
+<!-- colors=rainbow(length(unique(data9$STATUS))) -->
+
+<!-- #create colored plot -->
+
+<!-- plot(tsne$Y,col=colors) -->
+
+<!-- # make tsne object as dataframe -->
+
+<!-- tsne_df <- as.data.frame(tsne$Y) -->
+<!-- #extract labels of samples -->
+<!-- lab <- data9$STATUS -->
+<!-- #combine samples with t sne plot -->
+<!-- tsne_df1 <- cbind(tsne_df,lab) -->
+<!-- #add column names -->
+<!-- colnames(tsne_df1) <- c("X","Y","Labels") -->
+<!-- # create colored plot -->
+<!-- plot <- ggplot(tsne_df1,aes(X,Y,color=Labels)) + geom_point() -->
+
+<!-- plot -->
+
+<!-- ``` -->
+<!-- we try quantile normalization method -->
+
+<!-- ```{r} -->
+
+<!-- #label <- names(combined.mir.hc[,1]) -->
+
+
+<!-- mir.matrix <- normalize.quantiles(as.matrix(combined.mir.hc[,2:1052]), copy = TRUE) -->
+
+<!-- mir.df<-data.frame(STATUS=combined.mir.hc$STATUS) %>%  -->
+<!--   bind_cols(as.data.frame(mir.matrix)) -->
+<!-- ``` -->
+
+
+<!-- ```{r} -->
+<!-- str(mir.df) -->
+
+<!-- ``` -->
+
+
+<!-- PCA on Mir without labels -->
+
+<!-- ```{r} -->
+<!-- pcamir.comb <- prcomp(mir.df[,-1], center = F) # quintile normalization handles this automatically, scaling reduces variance explained by PC -->
+
+<!-- pcamir.comb$sdev -->
+
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- pca.plot.comb <- autoplot(pcamir.comb, data = mir.df,colour = 'STATUS',alpha=0.5,label = TRUE, FRAME = TRUE, frame.type = "norm") -->
+<!-- pca.plot.comb -->
+
+<!-- ``` -->
+
+
+<!-- ```{r} -->
+
+
+<!--  pca3d( pcamir.comb, group= mir.df[,1]) -->
+<!-- ``` -->
+
+<!-- Hierchical clsutering  -->
+<!-- ```{r} -->
+<!-- library(stats) -->
+<!-- library(tools) -->
+
+
+<!-- mir.hc <- combined.mir1 -->
+
+<!-- head(mir.hc) -->
+
+
+<!-- mir.matrix <- normalize.quantiles(as.matrix(mir.hc[,2:1052]), copy = TRUE) -->
+
+<!-- mir.df<-data.frame(STATUS= mir.hc$STATUS) %>%  -->
+<!--   bind_cols(as.data.frame(mir.matrix)) -->
+<!-- #str(mir.hc) -->
+<!-- #data is already transposed so that obeservations are rows and variables are columns -->
+
+
+<!-- # Define clustering and save in a object -->
+<!-- # specify distance matrix (euclidean / manhattan / maximum / canberra / binary / minkowski) and linkage(single / complete / average / mean / centroid / ward.D / ward.D2) type -->
+<!-- mir.cl <- hclust(dist (mir.df, method="euclidean"), method="complete") -->
+
+<!-- plot(mir.cl, cex = 0.6) -->
+
+
+<!-- #Define parameters and save in object -->
+<!-- descr1 <- paste ("Distance: ", "euclidean", sep="") -->
+<!-- descr2 <- paste ("Linkage: ", "complete", sep="") -->
+
+<!-- #Plot Clusters -->
+<!-- plot(mir.cl, xlab=descr1, sub=descr2, cex = 0.6) -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- #cutree to get the required number of clusters and output cluster IDs for all the samples -->
+<!-- clust_ids <- cutree(mir.cl, k=4) -->
+<!-- head(clust_ids) -->
+
+<!-- df <- as.data.frame(clust_ids) -->
+
+
+
+<!-- #Write into a file -->
+<!-- #write.table (df, file="mircluster.txt",sep="\t") -->
+
+<!-- ``` -->
+
+
+Run several classification models on combined Pheno and MiRNA data
+read in data
+```{r}
+
+#remove id column and read in data
+dat <- combined.mir1[,-1]
+
+
+#save(dat, file="dat.rda")
+#names(dat)
+
+```
+check str
+```{r}
+# str(dat)
+# 
+# table(dat$STATUS)
+
+```
+
+
+
+## split data
+```{r}
+set.seed(525)
+mir_split <- dat %>%
+  initial_split(prop = 0.8, strata = STATUS)
+mir_train <- training(mir_split)
+mir_test <- testing(mir_split)
+#ready <- mir_test
+#save(ready, file="ready.rda")
+```
+
+
+## preprocessing
+```{r}
+mir_recipe <- recipe(STATUS ~ ., data = mir_train) %>%
+  step_normalize(all_numeric_predictors()) %>%
+ # step_dummy(all_nominal_predictors(),- all_outcomes()) %>%
+  step_upsample(STATUS, over_ratio = 1) %>%
+  step_nzv(all_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_corr(all_predictors()) %>%
+  prep()
+mir_recipe
+
+```
+
+
+to get insight into how the data was handled -->
+```{r}
+mir_prep <- prep(mir_recipe)
+mir_prep
+```
+
+```{r}
+mir_removed <- prep(mir_recipe, training = mir_train)
+
+tidy(mir_removed)
+```
+
+create supplementary files 
+```{r}
+
+# #nzv
+# mir_nzv <- tidy(mir_removed, number=3) 
+# 
+# write.csv(mir_nzv,"mir_nzv.csv")
+# 
+# #zv
+# mir_zv <- tidy(mir_removed, number=4) 
+# 
+# write.csv(mir_zv,"mir_zv.csv")
+# 
+# # correlated
+# 
+# mir_corr <- tidy(mir_removed, number=5) 
+# 
+# write.csv(mir_corr,"mir_corr.csv")
+```
+#429 remove as nzv
+#63 removed as corr
+#total=492
+#remaining = 1053-492= 561
+```{r}
+mir_train_baked <- bake(mir_recipe, NULL)
+mir_test_baked <- bake(mir_recipe, new_data = mir_test)
+table(mir_train_baked$STATUS)
+table(mir_test_baked$STATUS)
+```
+
+
+## random forest
+
+### model specification and workflow creation
+```{r}
+rf.mir <- rand_forest(mtry = tune(),
+                  trees = tune(),
+                  min_n = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("ranger",num.threads = 5, importance = "impurity")
+rf.mir_wf <-
+  workflow() %>%
+  add_model(rf.mir) %>%
+  add_recipe(mir_recipe)
+```
+
+
+### prepare for hyperparameter tuning
+```{r}
+rf.mir_grid <- grid_regular(mtry(range = c(5L,15L)),
+                        min_n(range = c(5, 10)),
+                        trees(range = c(1000L, 2000L)),
+                             levels = 2)
+set.seed(525)
+mir_folds <- vfold_cv(mir_train, v = 10, repeats = 1)
+```
+
+
+### train and tune model (with tune_grid)
+```{r}
+doParallel::registerDoParallel(cores = 5)
+metrics = metric_set(roc_auc,accuracy,sens,spec,mcc)
+rf.mir_res <-
+  rf.mir_wf %>%
+  tune_grid(
+    resamples = mir_folds,
+    grid = rf.mir_grid,
+    metrics = metrics,
+    control = control_grid(save_pred = TRUE)
+    )
+doParallel::stopImplicitCluster()
+foreach::registerDoSEQ()
+```
+
+
+### evaluate the models
+```{r}
+rf.mir_res %>%
+  collect_metrics() %>%
+  ggplot(aes(x = mtry, y = mean, color = .metric)) +
+  geom_point() +
+  geom_line() + ylab("") +
+  facet_wrap(~trees + min_n) +
+  ggtitle(label = "model performance",
+          subtitle = "random forest")
+rf.mir_best <- rf.mir_res %>%
+  select_best(metric = "roc_auc")
+rf.mir_auc <-
+  rf.mir_res %>%
+  collect_predictions(parameters = rf.mir_best) %>%
+  roc_curve(truth = STATUS, estimate = .pred_no) %>%
+  mutate(model = "random forest")
+autoplot(rf.mir_auc)
+```
+
+### train and fit the best model
+```{r}
+
+set.seed(567)
+final_rf.mir_wf <-
+  rf.mir_wf %>%
+  finalize_workflow(parameters = rf.mir_best)
+#saveRDS(final_rf.mir_wf,file="final_rf.mir_wf.RDS")
+final_rf.mir_fit <-
+  final_rf.mir_wf %>%
+  last_fit(mir_split,
+           metrics = metrics)
+final_rf.mir_fit %>%
+  collect_metrics()
+final_rf.mir_fit %>%
+  collect_predictions() %>%
+  roc_curve(truth = STATUS, estimate = .pred_no) %>%
+  autoplot()
+```
+
+<!-- inspect parameters -->
+<!-- ```{r} -->
+<!-- rf.mir_fit <- fit(final_rf.mir_wf,data=dat) -->
+
+<!-- rf.mir_fit -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+
+<!-- final_rf.mir_fit %>%  -->
+<!--   pluck(".workflow", 1) %>%    -->
+<!--   pull_workflow_fit() %>%  -->
+<!--   vip(num_features = 20) -->
+
+
+<!-- ``` -->
+
+
+
+
+## logistic regression
+
+### model specification and workflow creation
+```{r}
+mir_reg <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_mode(mode = "classification") %>%
+  set_engine(engine = "glmnet")
+lr.mir_wf <- workflow() %>%
+  add_recipe(mir_recipe) %>%
+  add_model(mir_reg)
+```
+
+
+### prepare for hyperparameter tuning
+```{r}
+lr.mir_param <- parameters(mir_reg)
+lr.mir_grid <- grid_regular(penalty(), mixture(), levels = 3)
+set.seed(525)
+mir_folds <- vfold_cv(mir_train, v = 10, repeats = 1)
+```
+
+
+### train and tune model (with tune_grid)
+```{r}
+parallel::detectCores(logical = FALSE)
+doParallel::registerDoParallel(cores = 5)
+metrics = metric_set(roc_auc,accuracy,sens,spec,mcc)
+lr.mir_res <-
+  lr.mir_wf %>%
+  tune_grid(
+    resamples = mir_folds,
+    grid = lr.mir_grid,
+    metrics = metrics,
+    control = control_grid(save_pred = TRUE)
+    )
+doParallel::stopImplicitCluster()
+foreach::registerDoSEQ()
+```
+
+### evaluate the models
+```{r}
+lr.mir_res %>%
+  collect_metrics() %>%
+  ggplot(aes(x = penalty, y = mean, color = .metric)) +
+  geom_point() +
+  geom_line() + ylab("") +
+  facet_wrap(~mixture) +
+  scale_x_log10(labels = scales::label_scientific()) +
+  ggtitle(label = "model performance",
+          subtitle = "logistic regression")
+lr.mir_best <- lr.mir_res %>%
+  select_best(metric = "roc_auc")
+lr.mir_auc <-
+  lr.mir_res %>%
+  collect_predictions(parameters = lr.mir_best) %>%
+  roc_curve(truth = STATUS, estimate = .pred_no) %>%
+  mutate(model = "Logistic Regression")
+autoplot(lr.mir_auc)
+```
+
+
+### train and fit the best model
+```{r}
+
+set.seed(525)
+final_lr.mir_wf <-
+  lr.mir_wf %>%
+  finalize_workflow(parameters = lr.mir_best)
+final_lr.mir_fit <-
+  final_lr.mir_wf %>%
+  last_fit(mir_split,
+           metrics = metrics)
+final_lr.mir_fit %>%
+  collect_metrics()
+final_lr.mir_fit %>%
+  collect_predictions() %>%
+  roc_curve(truth = STATUS, estimate = .pred_no) %>%
+  autoplot()
+#saveRDS(final_lr.mir_wf,file="final_lr.mir_wf.RDS")
+```
+
+#will not use KNN since it doesnt work well for high dimensional data
+
+## xg boost
+
+### model specification and workflow creation
+```{r}
+bt <- boost_tree(learn_rate = tune(), ) %>%
+  set_mode("classification") %>%
+  set_engine("xgboost")
+bt_wf <-
+  workflow() %>%
+  add_model(bt) %>%
+  add_recipe(mir_recipe)
+```
+
+
+### prepare for hyperparameter tuning
+```{r}
+bt_param <- parameters(bt)
+bt_grid <- grid_regular(learn_rate(), levels = 3)
+set.seed(525)
+mir_folds <- vfold_cv(mir_train, v = 10, repeats = 1)
+```
+
+
+### train and tune model (with tune_grid)
+```{r}
+doParallel::registerDoParallel(cores = 5)
+metrics = metric_set(roc_auc, accuracy,sens,spec,mcc)
+bt_res <-
+  bt_wf %>%
+  tune_grid(
+    resamples = mir_folds,
+    grid = bt_grid,
+    metrics = metrics,
+    control = control_grid(save_pred = TRUE)
+    )
+doParallel::stopImplicitCluster()
+foreach::registerDoSEQ()
+```
+
+
+### evaluate the models
+```{r}
+bt_res %>%
+  collect_metrics() %>%
+  ggplot(aes(x = learn_rate, y = mean, color = .metric)) +
+  geom_point() +
+  geom_line() + ylab("") +
+  ggtitle(label = "model performance",
+          subtitle = "xgboost")
+bt_best <- bt_res %>%
+  select_best(metric = "roc_auc")
+bt_auc <-
+  bt_res %>%
+  collect_predictions(parameters = bt_best) %>%
+  roc_curve(truth = STATUS, estimate = .pred_no) %>%
+  mutate(model = "xgboost")
+autoplot(bt_auc)
+```
+
+### train and fit the best model
+```{r}
+
+set.seed(567)
+final_bt_wf <-
+  bt_wf %>%
+  finalize_workflow(parameters = bt_best)
+final_bt_fit <-
+  final_bt_wf %>%
+  last_fit(mir_split,
+           metrics = metrics)
+final_bt_fit %>%
+  collect_metrics()
+final_bt_fit %>%
+  collect_predictions() %>%
+  roc_curve(truth = STATUS, estimate = .pred_no) %>%
+  autoplot()
+```
+
+## svm polynomial
+
+### model specification and workflow creation
+```{r}
+svmp <- svm_poly(degree = tune()) %>%
+  set_engine("kernlab") %>%
+  set_mode("classification")
+svmp_wf <-
+  workflow() %>%
+  add_model(svmp) %>%
+  add_recipe(mir_recipe)
+```
+
+
+### prepare for hyperparameter tuning
+```{r}
+svm_param <- parameters(svmp)
+svmp_grid <- grid_regular(degree(), levels = 3)
+set.seed(525)
+mir_folds <- vfold_cv(mir_train, v = 10, repeats = 1)
+```
+
+
+### train and tune model (with tune_grid)
+```{r}
+doParallel::registerDoParallel(cores = 5)
+metrics = metric_set(roc_auc,accuracy,sens,spec,mcc)
+svmp_res <-
+  svmp_wf %>%
+  tune_grid(
+    resamples = mir_folds,
+    grid = svmp_grid,
+    metrics = metrics,
+    control = control_grid(save_pred = TRUE)
+    )
+doParallel::stopImplicitCluster()
+foreach::registerDoSEQ()
+```
+
+
+### evaluate the models
+```{r}
+svmp_res %>%
+  collect_metrics() %>%
+  ggplot(aes(x = degree, y = mean, color = .metric)) +
+  geom_point() +
+  geom_line() + ylab("") +
+  ggtitle(label = "model performance",
+          subtitle = "svm polynomial")
+svmp_best <- svmp_res %>%
+  select_best(metric = "roc_auc")
+svmp_auc <-
+  svmp_res %>%
+  collect_predictions(parameters = svmp_best) %>%
+  roc_curve(truth = STATUS, estimate = .pred_no) %>%
+  mutate(model = "svm polynomial")
+autoplot(svmp_auc)
+```
+
+### train and fit the best model
+```{r}
+set.seed(567)
+final_svmp_wf <-
+  svmp_wf %>%
+  finalize_workflow(parameters = svmp_best)
+final_svmp_fit <-
+  final_svmp_wf %>%
+  last_fit(mir_split,
+           metrics = metrics)
+final_svmp_fit %>%
+  collect_metrics()
+final_svmp_fit %>%
+  collect_predictions() %>%
+  roc_curve(truth = STATUS, estimate = .pred_no) %>%
+  autoplot()
+```
+
+## svm radial kernel
+
+### model specification and workflow creation
+```{r}
+svmr <- svm_rbf(rbf_sigma = tune(),
+                cost = tune()) %>%
+  set_engine("kernlab") %>%
+  set_mode("classification")
+svmr_wf <-
+  workflow() %>%
+  add_model(svmr) %>%
+  add_recipe(mir_recipe)
+```
+
+
+### prepare for hyperparameter tuning
+```{r}
+svmr_param <- parameters(svmr)
+svmr_grid <-
+  grid_regular(cost(), rbf_sigma(), levels = 3)
+set.seed(525)
+mir_folds <- vfold_cv(mir_train, v = 10, repeats = 1)
+```
+
+
+### train and tune model (with tune_grid)
+```{r}
+doParallel::registerDoParallel(cores = 5)
+metrics = metric_set(roc_auc,accuracy,sens,spec,mcc)
+svmr_res <-
+  svmr_wf %>%
+  tune_grid(
+    resamples = mir_folds,
+    grid = svmr_grid,
+    metrics = metrics,
+    control = control_grid(save_pred = TRUE)
+    )
+doParallel::stopImplicitCluster()
+foreach::registerDoSEQ()
+```
+
+
+### evaluate the models
+```{r}
+svmr_res %>%
+  collect_metrics() %>%
+  ggplot(aes(x = cost, y = mean, color = .metric)) +
+  geom_point() +
+  geom_line() + ylab("") +
+  facet_wrap(~rbf_sigma) +
+  ggtitle(label = "model performance",
+          subtitle = "svm radial")
+svmr_best <- svmr_res %>%
+  select_best(metric = "roc_auc")
+svmr_auc <-
+  svmr_res %>%
+  collect_predictions(parameters = svmr_best) %>%
+  roc_curve(truth = STATUS, estimate = .pred_no) %>%
+  mutate(model = "svm radial")
+autoplot(svmr_auc)
+
+svmr_best
+```
+
+### train and fit the best model
+```{r}
+set.seed(525)
+
+final_svmr_wf <-
+  svmr_wf %>%
+  finalize_workflow(parameters = svmr_best)
+
+final_svmr_fit <-
+  final_svmr_wf %>%
+  last_fit(mir_split,
+           metrics = metrics)
+
+final_svmr_fit %>%
+  collect_metrics()
+final_svmr_fit %>%
+  collect_predictions() %>%
+  roc_curve(truth = STATUS, estimate = .pred_no) %>%
+  autoplot()
+```
+
+
+SVMR radial has the best metrics with good RUC and good sens and spec, we will get MiRNA predictors from it
+
+
+
+how to compute variable importance for a model like an SVM, which does not have information within it about variable importance like a linear model or a tree-based model. In this case, we can use a method like permutation of the variables.https://juliasilge.com/blog/last-airbender/
+```{r}
+library(vip)
+set.seed(345)
+mir_imp <- final_svmr_wf %>%
+  fit(mir_train) %>%
+  pull_workflow_fit()%>%
+  vi(
+    method = "permute", nsim = 10,
+    target = "STATUS", metric = "auc", reference_class = "no",
+    pred_wrapper = kernlab::predict, train = juice(mir_prep)
+  )
+
+mir_imp %>%
+  slice_max(Importance, n = 10)%>%
+  mutate(Variable = fct_reorder(Variable, Importance)
+  ) %>%
+  ggplot(aes(Importance, Variable, color = Variable)) +
+  geom_errorbar(aes(xmin = Importance - StDev, xmax = Importance + StDev),
+    alpha = 0.5, size = 1.3
+  ) +
+  geom_point(size = 3)
+
+#get most important mRNAs
+mir_imp$Variable
+
+```
+
+
+get most important 20 MiRNA, pheno and patientID, status to create a subset of merge later with RNA predictors
+
+```{r}
+imp.mir<- c("patientID",                                
+    "hsa-mir-1252",                                                              
+   "hsa-mir-340",                                                               
+   "hsa-mir-145",                                                               
+  "hsa-mir-326" ,                                                              
+  "hsa-mir-320b-2",                                                            
+   "hsa-mir-4326" ,                                                             
+  "hsa-mir-548b" ,                                                             
+  "hsa-mir-125b-1",                                                            
+  "hsa-mir-132",                                                               
+ "hsa-mir-205",                                                               
+ "hsa-mir-212",                                                               
+ "hsa-mir-23b",                                                               
+ "hsa-mir-24-1",                                                              
+ "hsa-mir-320a",                                                              
+ "hsa-mir-328" ,                                                              
+ "hsa-mir-34a",                                                               
+    "hsa-mir-376a-1",                                                            
+ "hsa-mir-377" ,                                                             
+ "hsa-mir-378",                                                               
+ "hsa-mir-3909")  
+
+```
+
+Create a dataset with most important Mirna and phenotype variables imp.mir
+```{r}
+
+mir.pheno <- combined.mir1 %>% 
+  select(imp.mir)
+
+#save important mir and pheno data
+
+#save(mir.pheno, file="mir.phenorrda").rda
+
+
+```
+
+look for imp predictors in RNA data
+read in data
+
+```{r}
+
+
+dat.rna <- combined.rna [,-1]
+
+
+
+```
+check str
+```{r}
+str(dat.rna)
+
+table(dat.rna$STATUS)
+
+```
+
+## split data
+```{r}
+set.seed(525)
+rna_split <- dat.rna %>%
+  initial_split(prop = 0.8, strata = STATUS)
+rna_train <- training(rna_split)
+rna_test <- testing(rna_split)
+#ready <- rna_test
+#save(ready, file="ready.rda")
+```
+
+```{r}
+rna_recipe <- recipe(rna_train) %>%
+  update_role(everything()) %>%
+  update_role(STATUS,new_role = "outcome") %>% 
+  step_normalize(all_numeric_predictors()) %>%
+  step_upsample(STATUS, over_ratio = 1) %>%
+  step_nzv(all_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  #step_corr(all_predictors()) %>% 
+  prep()
+
+
+rna_recipe
+```
+
+look at how the data was preprocessed
+```{r}
+rna_prep <- prep(rna_recipe)
+rna_prep
+```
+
+create supplementary material for variables removed at each step
+```{r}
+# rna_removed <- prep(rna_recipe, training = rna_train)
+# 
+# tidy(rna_removed)
+
+```
+
+create supplementary files 
+
+```{r}
+
+#nzv
+# rna_nzv <- tidy(rna_removed, number=3)
+#
+# write.csv(rna_nzv,"rna_nzv.csv")
+#
+# #zv
+# rna_zv <- tidy(rna_removed, number=4)
+#
+# write.csv(rna_zv,"rna_zv.csv")
+
+```
+
+```{r}
+rna_train_baked <- bake(rna_recipe, NULL)
+rna_test_baked <- bake(rna_recipe, new_data = rna_test)
+table(rna_train_baked$STATUS)
+table(rna_test_baked$STATUS)
+```
+
+
+## random forest
+
+### model specification and workflow creation
+```{r}
+rf.rna <- rand_forest(mtry = tune(),
+                  trees = tune(),
+                  min_n = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("ranger",num.threads = 5, importance = "impurity")
+rf.rna_wf <-
+  workflow() %>%
+  add_model(rf.rna) %>%
+  add_recipe(rna_recipe)
+```
+
+
+### prepare for hyperparameter tuning
+```{r}
+rf.rna_grid <- grid_regular(mtry(range = c(5L,15L)),
+                        min_n(range = c(5, 10)),
+                        trees(range = c(1000L, 2000L)),
+                             levels = 2)
+set.seed(525)
+rna_folds <- vfold_cv(rna_train, v = 10, repeats = 1)
+```
+
+
+### train and tune model (with tune_grid)
+```{r}
+doParallel::registerDoParallel(cores = 5)
+metrics = metric_set(roc_auc,accuracy,sens,spec,mcc)
+rf.rna_res <-
+  rf.rna_wf %>%
+  tune_grid(
+    resamples = rna_folds,
+    grid = rf.rna_grid,
+    metrics = metrics,
+    control = control_grid(save_pred = TRUE)
+    )
+doParallel::stopImplicitCluster()
+foreach::registerDoSEQ()
+```
+
+
+### evaluate the models
+```{r}
+rf.rna_res %>%
+  collect_metrics() %>%
+  ggplot(aes(x = mtry, y = mean, color = .metric)) +
+  geom_point() +
+  geom_line() + ylab("") +
+  facet_wrap(~trees + min_n) +
+  ggtitle(label = "model performance",
+          subtitle = "random forest")
+rf.rna_best <- rf.rna_res %>%
+  select_best(metric = "roc_auc")
+rf.rna_auc <-
+  rf.rna_res %>%
+  collect_predictions(parameters = rf.rna_best) %>%
+  roc_curve(truth = STATUS, estimate = .pred_no) %>%
+  mutate(model = "random forest")
+autoplot(rf.rna_auc)
+
+
+rf.rna_best
+```
+
+### train and fit the best model
+```{r}
+
+set.seed(567)
+final_rf.rna_wf <-
+  rf.rna_wf %>%
+  finalize_workflow(parameters = rf.rna_best)
+#saveRDS(final_rf.rna_wf,file="final_rf.rna_wf.RDS")
+final_rf.rna_fit <-
+  final_rf.rna_wf %>%
+  last_fit(rna_split,
+           metrics = metrics)
+final_rf.rna_fit %>%
+  collect_metrics()
+final_rf.rna_fit %>%
+  collect_predictions() %>%
+  roc_curve(truth = STATUS, estimate = .pred_no) %>%
+  autoplot()
+```
+
+inspect parameters
+```{r}
+rf.rna_fit <- fit(final_rf.rna_wf,data=dat)
+
+rf.rna_fit
+```
+
+```{r}
+
+vip1 <- final_rf.rna_fit %>%
+  pluck(".workflow", 1) %>%
+  pull_workflow_fit() %>%
+  vip(num_features = 20)
+
+vip1
+
+#get list of important variables
+vip1$data$Variable
+
+```
+
+
+
+
+## logistic regression
+
+### model specification and workflow creation
+```{r}
+rna_reg <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_mode(mode = "classification") %>%
+  set_engine(engine = "glmnet")
+lr.rna_wf <- workflow() %>%
+  add_recipe(rna_recipe) %>%
+  add_model(rna_reg)
+```
+
+
+### prepare for hyperparameter tuning
+```{r}
+lr.rna_param <- parameters(rna_reg)
+lr.rna_grid <- grid_regular(penalty(), mixture(), levels = 3)
+set.seed(525)
+rna_folds <- vfold_cv(rna_train, v = 10, repeats = 1)
+```
+
+
+### train and tune model (with tune_grid)
+```{r}
+parallel::detectCores(logical = FALSE)
+doParallel::registerDoParallel(cores = 5)
+metrics = metric_set(roc_auc,accuracy,sens,spec,mcc)
+lr.rna_res <-
+  lr.rna_wf %>%
+  tune_grid(
+    resamples = rna_folds,
+    grid = lr.rna_grid,
+    metrics = metrics,
+    control = control_grid(save_pred = TRUE)
+    )
+doParallel::stopImplicitCluster()
+foreach::registerDoSEQ()
+```
+
+### evaluate the models
+```{r}
+lr.rna_res %>%
+  collect_metrics() %>%
+  ggplot(aes(x = penalty, y = mean, color = .metric)) +
+  geom_point() +
+  geom_line() + ylab("") +
+  facet_wrap(~mixture) +
+  scale_x_log10(labels = scales::label_scientific()) +
+  ggtitle(label = "model performance",
+          subtitle = "logistic regression")
+lr.rna_best <- lr.rna_res %>%
+  select_best(metric = "roc_auc")
+lr.rna_auc <-
+  lr.rna_res %>%
+  collect_predictions(parameters = lr.rna_best) %>%
+  roc_curve(truth = STATUS, estimate = .pred_no) %>%
+  mutate(model = "Logistic Regression")
+autoplot(lr.rna_auc)
+
+
+lr.rna_best
+```
+
+
+### train and fit the best model
+```{r}
+
+set.seed(525)
+final_lr.rna_wf <-
+  lr.rna_wf %>%
+  finalize_workflow(parameters = lr.rna_best)
+final_lr.rna_fit <-
+  final_lr.rna_wf %>%
+  last_fit(rna_split,
+           metrics = metrics)
+final_lr.rna_fit %>%
+  collect_metrics()
+final_lr.rna_fit %>%
+  collect_predictions() %>%
+  roc_curve(truth = STATUS, estimate = .pred_no) %>%
+  autoplot()
+#saveRDS(final_lr.rna_wf,file="final_lr.rna_wf.RDS")
+```
+get vips
+```{r}
+vip2<-final_lr.rna_fit %>%
+  pluck(".workflow", 1) %>%
+  pull_workflow_fit() %>%
+  vip(num_features = 20)
+
+vip2$data$Variable
+```
+##########KNN did not converge##############
+
+## xg boost
+
+### model specification and workflow creation
+```{r}
+bt.rna <- boost_tree(learn_rate = tune(), ) %>%
+  set_mode("classification") %>%
+  set_engine("xgboost")
+bt.rna_wf <-
+  workflow() %>%
+  add_model(bt.rna) %>%
+  add_recipe(rna_recipe)
+```
+
+
+### prepare for hyperparameter tuning
+```{r}
+bt.rna_param <- parameters(bt.rna)
+bt.rna_grid <- grid_regular(learn_rate(), levels = 3)
+set.seed(525)
+rna_folds <- vfold_cv(rna_train, v = 10, repeats = 1)
+```
+
+
+### train and tune model (with tune_grid)
+```{r}
+doParallel::registerDoParallel(cores = 5)
+metrics = metric_set(roc_auc, accuracy,sens,spec,mcc)
+bt.rna_res <-
+  bt.rna_wf %>%
+  tune_grid(
+    resamples = rna_folds,
+    grid = bt.rna_grid,
+    metrics = metrics,
+    control = control_grid(save_pred = TRUE)
+    )
+doParallel::stopImplicitCluster()
+foreach::registerDoSEQ()
+```
+
+
+### evaluate the models
+```{r}
+bt.rna_res %>%
+  collect_metrics() %>%
+  ggplot(aes(x = learn_rate, y = mean, color = .metric)) +
+  geom_point() +
+  geom_line() + ylab("") +
+  ggtitle(label = "model performance",
+           subtitle = "xgboost")
+bt.rna_best <- bt.rna_res %>%
+  select_best(metric = "roc_auc")
+bt.rna_auc <-
+  bt.rna_res %>%
+  collect_predictions(parameters = bt.rna_best) %>%
+  roc_curve(truth = STATUS, estimate = .pred_no) %>%
+  mutate(model = "xgboost")
+autoplot(bt.rna_auc)
+
+
+bt.rna_best
+```
+
+### train and fit the best model
+```{r}
+
+set.seed(567)
+final_bt.rna_wf <-
+  bt.rna_wf %>%
+  finalize_workflow(parameters = bt.rna_best)
+final_bt.rna_fit <-
+  final_bt.rna_wf %>%
+  last_fit(rna_split,
+           metrics = metrics)
+final_bt.rna_fit %>%
+  collect_metrics()
+final_bt.rna_fit %>%
+  collect_predictions() %>%
+  roc_curve(truth = STATUS, estimate = .pred_no) %>%
+  autoplot()
+```
+
+get vip
+
+
+
+```{r}
+
+vipxg <- final_bt.rna_fit %>%
+  pluck(".workflow", 1) %>%
+  pull_workflow_fit() %>%
+  vip(num_features = 50)
+
+vipxg
+
+#get list of important variables
+vipxg$data$Variable
+
+```
+
+
+## svm polynomial(model not converged)
+
+
+## svm radial kernel, (model failed)modle not converged
+
+
+
+## linear discriminant , model not converged
+
+
+
+
+
+create a dataset with patient ID ,status and top 20  most important RNA predictors from random forest and logistic regression
+```{r}
+ imp.rna <- c("patientID","STATUS","STXBP6","ZNF467",                                           
+"RGPD5","FCGR2A" ,                                          
+ "PRR13","LOC642852",                                        
+ "CENPE", "NPTX2" ,                                           
+"KBTBD3","FUCA2",                                            
+"C11orf1","PAX9" ,                                            
+"patient.stage_event.gleason_grading.gleason_score" ,"SPNS1" ,                                           
+"HIST1H2AC","ADAMTS7",                                          
+"ZNRF3","SH3BGRL2",                                         
+"C16orf59","CDH24",                      
+"EDA2R", "FAM36A", "PCDHGA10",                                         
+"GOLGA3", "HIST1H2AC",                                        
+"IL12A","ALG1L2",                                           
+ "NUP43","LOC440173",                                        
+"OR52N2", "TRH",                                              
+"DGAT2L6", "SEMA6B",                                           
+"PROX2","DDX31" ,                                           
+"FAM133B","NCRNA00230B",                                      
+ "RGPD5","PRRT3")   
+
+
+length(imp.rna)
+
+test<- imp.rna %>% 
+    kable()
+
+test %>% 
+  kable_paper()
+```
+
+create a subset of rna data with most important predictors
+```{r}
+imp.rna <- combined.rna %>% 
+  select(imp.rna)
+# save subset of important RNA
+#save(imp.rna, file="imp.rna.rda")
+```
+
+
+
+
+merge imp rna with pheno.mir
+
+
+```{r}
+pheno.mir.rna <- left_join(mir.pheno,imp.rna,by="patientID")
+
+
+table(pheno.mir.rna$STATUS)
+
+
+names(pheno.mir.rna)
+
+dim(pheno.mir.rna)
+
+# save this final subset of important RNA, pheno and mir
+#save(pheno.mir.rna, file="pheno.mir.rna.rda")
+
+
+
+```
+
+#Now keep heldout data in the same dimensions as pheno.mir.rna
+
+
+```{r}
+
+keep <- c("patientID"               ,                          "hsa-mir-1252" ,                                    
+  "hsa-mir-340"   ,                                    "hsa-mir-145",                                      
+ "hsa-mir-326" ,                                      "hsa-mir-320b-2",                                   
+  "hsa-mir-4326",                                      "hsa-mir-548b" ,                                    
+ "hsa-mir-125b-1",                                    "hsa-mir-132" ,                                     
+ "hsa-mir-205" ,                                      "hsa-mir-212",                                      
+ "hsa-mir-23b" ,                                      "hsa-mir-24-1",                                     
+ "hsa-mir-320a",                                      "hsa-mir-328",                                      
+ "hsa-mir-34a" ,                                      "hsa-mir-376a-1" ,                                  
+ "hsa-mir-377" ,                                      "hsa-mir-378",                                      
+ "hsa-mir-3909",                                      "STATUS",                                           
+ "STXBP6"   ,                                         "ZNF467",                                           
+ "RGPD5" ,                                            "FCGR2A",                                           
+"PRR13"  ,                                           "LOC642852" ,                                       
+"CENPE"  ,                                           "NPTX2",                                            
+ "KBTBD3" ,                                           "FUCA2",                                            
+ "C11orf1"  ,                                         "PAX9",                                             
+ "patient.stage_event.gleason_grading.gleason_score", "SPNS1",                                          
+ "HIST1H2AC",                                         "ADAMTS7" ,                                         
+ "ZNRF3",                                             "SH3BGRL2",                                         
+"C16orf59",                                          "CDH24" ,                                           
+"EDA2R" ,                                            "FAM36A",                                           
+ "PCDHGA10",                                          "GOLGA3" ,                                          
+ "IL12A",                                             "ALG1L2",                                           
+"NUP43",                                             "LOC440173",                                        
+ "OR52N2",                                            "TRH",                                              
+ "DGAT2L6",                                           "SEMA6B" ,                                          
+ "PROX2",                                             "DDX31",                                            
+"FAM133B" ,                                          "NCRNA00230B",                                      
+ "PRRT3" )  
+
+```
+
+
+# keep variables in the held out set
+
+```{r}
+final_heldout <- combined_held_out %>% 
+  select(keep)
+
+all_equal(final_heldout,pheno.mir.rna)
+```
+
+run models
+
+
+clean data
+```{r}
+#clean trainsing data
+
+library(janitor)
+pheno.mir.rna1 <- pheno.mir.rna  %>% 
+  select(-patientID) %>% 
+rename(Gleason_Score = patient.stage_event.gleason_grading.gleason_score) %>% 
+  rename(recurrence=STATUS) %>% 
+  clean_names()
+
+#clean held out test data
+final_heldout1 <- final_heldout  %>% 
+  select(-patientID) %>% 
+rename(Gleason_Score = patient.stage_event.gleason_grading.gleason_score) %>% 
+  rename(recurrence=STATUS) %>% 
+  clean_names()
+
+#sanity check
+all_equal(final_heldout1,pheno.mir.rna1)
+
+#save datasets
+# save(pheno.mir.rna1, file="pheno.mir.rna1.rda")
+# 
+# save(final_heldout1, file="final_heldout1.rda")
+```
+
+
+
+
+## read in final_heldout1 and pheno.mir.rna1
+```{r}
+set.seed(525)
+omic_train <- pheno.mir.rna1
+omic_test <- final_heldout1
+
+```
+
+
+## preprocessing
+```{r}
+omic_recipe <- recipe(recurrence ~ ., data = omic_train) %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+ # step_dummy(all_nominal_predictors(),- all_outcomes()) %>% 
+  step_upsample(recurrence, over_ratio = 1) %>% 
+  step_nzv(all_predictors()) %>% 
+  step_zv(all_predictors()) %>% 
+ step_corr(all_predictors()) %>%  
+  prep()
+omic_recipe
+```
+
+
+
+
+
+
+```{r}
+omic_train_baked <- bake(omic_recipe, NULL)
+omic_test_baked <- bake(omic_recipe, new_data = omic_test)
+table(omic_train_baked$recurrence)
+table(omic_test_baked$recurrence)
+```
+
+
+
+```{r}
+
+plot_train <- ggplot(omic_train, aes(recurrence)) + 
+          geom_bar(aes(y = (..count..)/sum(..count..)),fill= "#56B4E9",color='darkblue', width = 0.95) + 
+          scale_y_continuous(labels=scales::percent) +
+   xlab("Recurrence Status") +
+  ylab("Relative frequencies")+
+  theme(axis.text = element_text(size = 11)) +
+  theme(axis.title = element_text(size = 11)) +
+   theme(aspect.ratio = 0.75/0.50)
+
+plot_train
+
+```
+
+plot after featuring upsampling
+
+```{r}
+plot_upsample_train <- ggplot(omic_train_baked, aes(recurrence)) + 
+          geom_bar(aes(y = (..count..)/sum(..count..)),fill= "#56B4E9",color='darkblue', width = 0.95) + 
+          scale_y_continuous(labels = function(x) paste0(x*100, "%")) +
+   xlab("Recurrence Status") +
+  ylab("Relative frequencies") +
+  theme(axis.text = element_text(size = 11)) +
+  theme(axis.title = element_text(size = 11)) +
+   theme(aspect.ratio = 0.75/0.50)
+
+
+plot_upsample_train
+
+
+```
+plot test set to show that upsampling was not performed on test set
+
+
+````{r}
+plot_upsample_test <- ggplot(omic_test_baked, aes(recurrence)) + 
+          geom_bar(aes(y = (..count..)/sum(..count..)),fill= "#56B4E9",color='darkblue', width = 0.95) + 
+          scale_y_continuous(labels=scales::percent) +
+   xlab("Recurrence Status") +
+  ylab("Relative frequencies") +
+  theme(axis.text = element_text(size = 11)) +
+  theme(axis.title = element_text(size = 11)) +
+   theme(aspect.ratio = 0.75/0.50)
+
+
+plot_upsample_test
+
+```
+```{r}
+
+library(ggpubr)
+
+ggarrange(plot_train,plot_upsample_train,plot_upsample_test,labels = c("A", "B", "C"),ncol=3,nrow = 2)
+
+```
+
+## random forest
+
+### model specification and workflow creation
+```{r}
+rf <- rand_forest(mtry = tune(), 
+                  trees = tune(), 
+                  min_n = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger",num.threads = 5, importance = "impurity")
+rf_wf <- 
+  workflow() %>% 
+  add_model(rf) %>% 
+  add_recipe(omic_recipe) 
+```
+
+
+### prepare for hyperparameter tuning
+```{r}
+rf_grid <- grid_regular(mtry(range = c(5L,15L)),
+                        min_n(range = c(5, 10)),
+                        trees(range = c(1000L, 2000L)),
+                             levels = 2)
+set.seed(525)
+omic_folds <- vfold_cv(omic_train, v = 10, repeats = 1)
+```
+
+
+### train and tune model (with tune_grid)
+```{r}
+set.seed(525)
+doParallel::registerDoParallel(cores = 5)
+metrics = metric_set(roc_auc, accuracy,sens,spec,mcc)
+rf_res <- 
+  rf_wf %>% 
+  tune_grid(
+    resamples = omic_folds,
+    grid = rf_grid, 
+    metrics = metrics,
+    control = control_grid(save_pred = TRUE)
+    )
+doParallel::stopImplicitCluster()
+foreach::registerDoSEQ()
+```
+
+
+### evaluate the models
+```{r}
+rf_res %>% 
+  collect_metrics() %>% 
+  ggplot(aes(x = mtry, y = mean, color = .metric)) + 
+  geom_point() + 
+  geom_line() + ylab("") +
+  facet_wrap(~trees + min_n) +
+  ggtitle(label = "model performance", 
+          subtitle = "random forest") 
+rf_best <- rf_res %>%
+  select_best(metric = "roc_auc")
+rf_auc <- 
+  rf_res %>% 
+  collect_predictions(parameters = rf_best) %>% 
+  roc_curve(truth = recurrence, estimate = .pred_no) %>% 
+  mutate(model = "random forest")
+autoplot(rf_auc)
+
+show_best(rf_res,metric = 'roc_auc')
+rf_best
+```
+
+### train and fit the best model
+```{r}
+
+set.seed(567)
+final_rf_wf <- 
+  rf_wf %>% 
+  finalize_workflow(parameters = rf_best)
+
+train.fit <- final_rf_wf %>% 
+  fit(omic_train)
+
+
+#saveRDS(final_rf_wf,file="final_rf_wf.RDS")
+
+
+```
+
+
+
+```{r}
+
+pred <- train.fit %>%
+
+  predict(new_data=omic_test,type="prob",class)
+
+
+two_class<- omic_test%>%
+  select(recurrence) %>% 
+  bind_cols(pred) %>% 
+  mutate(.pred_class=as.factor(if_else(.pred_no>0.5,"no","yes")))
+ 
+  
+  
+accuracy(two_class, truth = recurrence,estimate = .pred_class)
+
+sensitivity(two_class, truth = recurrence,estimate = .pred_class)
+
+specificity(two_class, truth = recurrence,estimate = .pred_class)
+
+roc_auc(two_class,truth = recurrence,estimate = .pred_no )
+
+
+
+```
+
+
+```{r}
+vip1 <- train.fit %>%
+  pull_workflow_fit() %>%
+  vip(num_features = 20)
+
+vip1
+
+#get list of important variables
+vip1$data$Variable
+
+
+```
+
+
+
+
+## logistic regression
+
+### model specification and workflow creation
+```{r}
+log_reg <- logistic_reg(penalty = tune(), mixture = tune()) %>% 
+  set_mode(mode = "classification") %>% 
+  set_engine(engine = "glmnet")
+lr_wf <- workflow() %>% 
+  add_recipe(omic_recipe) %>% 
+  add_model(log_reg)
+```
+
+
+### prepare for hyperparameter tuning
+```{r}
+
+
+lr_param <- parameters(log_reg)
+lr_grid <- grid_regular(penalty(), mixture(), levels = 3)
+set.seed(525)
+omic_folds <- vfold_cv(omic_train, v = 10, repeats = 1)
+```
+
+
+### train and tune model (with tune_grid)
+```{r}
+set.seed(525)
+parallel::detectCores(logical = FALSE)
+doParallel::registerDoParallel(cores = 5)
+metrics = metric_set(roc_auc, sens, spec,accuracy)
+lr_res <- 
+  lr_wf %>% 
+  tune_grid(
+    resamples = omic_folds,
+    grid = lr_grid, 
+    metrics = metrics,
+    control = control_grid(save_pred = TRUE)
+    )
+doParallel::stopImplicitCluster()
+foreach::registerDoSEQ()
+```
+penalty	
+A non-negative number representing the total amount of regularization (glmnet, LiblineaR, keras, and spark only). For keras models, this corresponds to purely L2 regularization (aka weight decay) while the other models can be either or a combination of L1 and L2 (depending on the value of mixture).
+
+mixture	
+A number between zero and one (inclusive) that is the proportion of L1 regularization (i.e. lasso) in the model. When mixture = 1, it is a pure lasso model while mixture = 0 indicates that ridge regression is being used. (glmnet, LiblineaR, and spark only). For LiblineaR models, mixture must be exactly 0 or 1 only.
+### evaluate the models
+### evaluate the models
+```{r}
+lr_res %>% 
+  collect_metrics() %>% 
+  ggplot(aes(x = penalty, y = mean, color = .metric)) + 
+  geom_point() + 
+  geom_line() + ylab("") +
+  facet_wrap(~mixture) +
+  scale_x_log10(labels = scales::label_scientific()) +
+  ggtitle(label = "model performance", 
+          subtitle = "logistic regression") 
+lr_best <- lr_res %>%
+  select_best(metric = "roc_auc")
+lr_auc <- 
+  lr_res %>% 
+  collect_predictions(parameters = lr_best) %>% 
+  roc_curve(truth = recurrence, estimate = .pred_no) %>% 
+  mutate(model = "Logistic Regression")
+autoplot(lr_auc)
+
+
+show_best(lr_res)
+```
+
+
+### train and fit the best model
+```{r}
+
+set.seed(523)
+final_lr_wf <- 
+  lr_wf %>% 
+  finalize_workflow(parameters = lr_best)
+
+#saveRDS(final_lr_wf,file="final_lr_wf.RDS")
+
+lr_fit <- 
+  final_lr_wf %>%
+  fit(omic_train) 
+
+
+lr_best
+```
+
+```{r}
+
+set.seed(523)
+
+pred <- lr_fit %>%
+
+  predict(new_data=omic_test,type="prob",class)
+
+
+two_class<- omic_test%>%
+  select(recurrence) %>% 
+  bind_cols(pred) %>% 
+  mutate(.pred_class=as.factor(if_else(.pred_no>0.5,"no","yes")))
+ 
+  
+#conf_mat(two_class, truth = recurrence,estimate = .pred_class)
+  
+accuracy(two_class, truth = recurrence,estimate = .pred_class)
+
+sensitivity(two_class, truth = recurrence,estimate = .pred_class)
+
+specificity(two_class, truth = recurrence,estimate = .pred_class)
+
+roc_auc(two_class,truth = recurrence,estimate = .pred_no )
+
+
+
+```
+
+
+```{r}
+vip1 <- lr_fit %>%
+  pull_workflow_fit() %>%
+  vip(num_features = 10)
+
+vip1
+
+#get list of important variables
+vip1$data$Variable
+
+
+```
+
+
+
+trying to get odds ratios
+```{r}
+
+library(broom)
+
+final_lr_wf1 <- 
+  lr_wf %>% 
+  finalize_workflow(parameters = lr_best) %>% 
+ fit(omic_train) %>%
+  pull_workflow_fit() %>%
+  tidy()%>%
+  arrange(desc(estimate)) %>% 
+  mutate(OddsRatio=exp(estimate))
+
+
+final_lr_wf1 %>% 
+  kbl()%>% 
+ kable_paper("hover", full_width = F)
+```
+
+
+
+
+## knn
+
+### model specification and workflow creation
+```{r}
+knn <- nearest_neighbor(neighbors = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("kknn")
+k_wf <- 
+  workflow() %>% 
+  add_model(knn) %>% 
+  add_recipe(omic_recipe) 
+```
+
+
+### prepare for hyperparameter tuning
+```{r}
+k_param <- parameters(knn)
+k_grid <- grid_regular(neighbors(), levels = 3)
+set.seed(525)
+omic_folds <- vfold_cv(omic_train, v = 5, repeats = 1)
+```
+
+
+### train and tune model (with tune_grid)
+```{r}
+set.seed(525)
+doParallel::registerDoParallel(cores = 5)
+metrics = metric_set(roc_auc, accuracy,sens,spec,mcc)
+k_res <- 
+  k_wf %>% 
+  tune_grid(
+    resamples = omic_folds,
+    grid = k_grid, 
+    metrics = metrics,
+    control = control_grid(save_pred = TRUE)
+    )
+doParallel::stopImplicitCluster()
+foreach::registerDoSEQ()
+```
+
+
+### evaluate the models
+```{r}
+k_res %>% 
+  collect_metrics() %>% 
+  ggplot(aes(x = neighbors, y = mean, color = .metric)) + 
+  geom_point() + 
+  geom_line() + ylab("") +
+  ggtitle(label = "model performance", 
+          subtitle = "knn") 
+k_best <- k_res %>%
+  select_best(metric = "roc_auc")
+k_auc <- 
+  k_res %>% 
+  collect_predictions(parameters = k_best) %>% 
+  roc_curve(truth = recurrence, estimate = .pred_no) %>% 
+  mutate(model = "knn")
+autoplot(k_auc)
+
+
+show_best(k_res,metric = 'roc_auc')
+```
+
+
+### train and fit the best model
+
+```{r}
+final_k_wf <- 
+  k_wf %>% 
+  finalize_workflow(parameters = k_best)
+
+final_k_fit <- 
+  final_k_wf %>%
+  fit(omic_train) 
+
+```
+
+```{r}
+
+pred <- final_k_fit %>%
+
+  predict(new_data=omic_test,type="prob",class)
+
+
+two_class<- omic_test%>%
+  select(recurrence) %>% 
+  bind_cols(pred) %>% 
+  mutate(.pred_class=as.factor(if_else(.pred_no>0.5,"no","yes")))
+ 
+  
+#conf_mat(two_class, truth = recurrence,estimate = .pred_class)
+  
+accuracy(two_class, truth = recurrence,estimate = .pred_class)
+
+sensitivity(two_class, truth = recurrence,estimate = .pred_class)
+
+specificity(two_class, truth = recurrence,estimate = .pred_class)
+
+roc_auc(two_class,truth = recurrence,estimate = .pred_no )
+
+
+
+```
+
+
+
+## svm polynomial
+
+### model specification and workflow creation
+```{r}
+svmp <- svm_poly(degree = tune()) %>% 
+  set_engine("kernlab") %>% 
+  set_mode("classification")
+svmp_wf <- 
+  workflow() %>% 
+  add_model(svmp) %>% 
+  add_recipe(omic_recipe) 
+```
+
+
+### prepare for hyperparameter tuning
+```{r}
+svm_param <- parameters(svmp)
+svmp_grid <- grid_regular(degree(), levels = 3)
+set.seed(525)
+omic_folds <- vfold_cv(omic_train, v = 5, repeats = 1)
+```
+
+
+### train and tune model (with tune_grid)
+```{r}
+set.seed(525)
+doParallel::registerDoParallel(cores = 5)
+metrics = metric_set(roc_auc, accuracy,sens,spec,mcc)
+svmp_res <- 
+  svmp_wf %>% 
+  tune_grid(
+    resamples = omic_folds,
+    grid = svmp_grid, 
+    metrics = metrics,
+    control = control_grid(save_pred = TRUE)
+    )
+doParallel::stopImplicitCluster()
+foreach::registerDoSEQ()
+```
+
+
+### evaluate the models
+```{r}
+svmp_res %>% 
+  collect_metrics() %>% 
+  ggplot(aes(x = degree, y = mean, color = .metric)) + 
+  geom_point() + 
+  geom_line() + ylab("") +
+  ggtitle(label = "model performance", 
+          subtitle = "svm polynomial") 
+svmp_best <- svmp_res %>%
+  select_best(metric = "roc_auc")
+svmp_auc <- 
+  svmp_res %>% 
+  collect_predictions(parameters = svmp_best) %>% 
+  roc_curve(truth = recurrence, estimate = .pred_no) %>% 
+  mutate(model = "svm polynomial")
+autoplot(svmp_auc)
+
+svmp_best
+```
+
+### train and fit the best model
+```{r}
+final_svmp_wf <- 
+  svmp_wf %>% 
+  finalize_workflow(parameters = svmp_best)
+final_svmp_fit <- 
+  final_svmp_wf %>%
+  fit(omic_train) 
+
+```
+
+
+
+
+```{r}
+
+pred <- final_svmp_fit %>%
+
+  predict(new_data=omic_test,type="prob",class)
+
+
+two_class<- omic_test%>%
+  select(recurrence) %>% 
+  bind_cols(pred) %>% 
+  mutate(.pred_class=as.factor(if_else(.pred_no>0.5,"no","yes")))
+ 
+  
+#conf_mat(two_class, truth = recurrence,estimate = .pred_class)
+  
+accuracy(two_class, truth = recurrence,estimate = .pred_class)
+
+sensitivity(two_class, truth = recurrence,estimate = .pred_class)
+
+specificity(two_class, truth = recurrence,estimate = .pred_class)
+
+roc_auc(two_class,truth = recurrence,estimate = .pred_no )
+
+
+
+```
+
+
+
+
+
+
+## svm radial kernel
+
+### model specification and workflow creation
+```{r}
+svmr <- svm_rbf(rbf_sigma = tune(), 
+                cost = tune()) %>% 
+  set_engine("kernlab") %>% 
+  set_mode("classification")
+svmr_wf <- 
+  workflow() %>% 
+  add_model(svmr) %>% 
+  add_recipe(omic_recipe) 
+```
+
+
+### prepare for hyperparameter tuning
+```{r}
+svmr_param <- parameters(svmr)
+svmr_grid <- 
+  grid_regular(cost(), rbf_sigma(), levels = 3)
+set.seed(525)
+omic_folds <- vfold_cv(omic_train, v = 10, repeats = 1)
+```
+
+
+### train and tune model (with tune_grid)
+```{r}
+set.seed(525)
+doParallel::registerDoParallel(cores = 5)
+metrics = metric_set(roc_auc, accuracy,sens,spec,mcc)
+svmr_res <- 
+  svmr_wf %>% 
+  tune_grid(
+    resamples = omic_folds,
+    grid = svmr_grid, 
+    metrics = metrics,
+    control = control_grid(save_pred = TRUE)
+    )
+doParallel::stopImplicitCluster()
+foreach::registerDoSEQ()
+```
+
+
+### evaluate the models
+```{r}
+svmr_res %>% 
+  collect_metrics() %>% 
+  ggplot(aes(x = cost, y = mean, color = .metric)) + 
+  geom_point() + 
+  geom_line() + ylab("") +
+  facet_wrap(~rbf_sigma) +
+  ggtitle(label = "model performance", 
+          subtitle = "svm radial")
+svmr_best <- svmr_res %>%
+  select_best(metric = "roc_auc")
+svmr_auc <- 
+  svmr_res %>% 
+  collect_predictions(parameters = svmr_best) %>% 
+  roc_curve(truth = recurrence, estimate = .pred_no) %>% 
+  mutate(model = "svm radial")
+autoplot(svmr_auc)
+
+svmr_best
+
+```
+
+### train and fit the best model
+```{r}
+final_svmr_wf <- 
+  svmr_wf %>% 
+  finalize_workflow(parameters = svmr_best)
+
+
+final_svmr_fit <- 
+  final_svmr_wf %>%
+  fit(omic_train) 
+
+
+
+```
+
+
+
+```{r}
+
+pred <- final_svmr_fit %>%
+
+  predict(new_data=omic_test,type="prob",class)
+
+
+two_class<- omic_test%>%
+  select(recurrence) %>% 
+  bind_cols(pred) %>% 
+  mutate(.pred_class=as.factor(if_else(.pred_no>0.5,"no","yes")))
+ 
+  
+#conf_mat(two_class, truth = recurrence,estimate = .pred_class)
+  
+accuracy(two_class, truth = recurrence,estimate = .pred_class)
+
+sensitivity(two_class, truth = recurrence,estimate = .pred_class)
+
+specificity(two_class, truth = recurrence,estimate = .pred_class)
+
+roc_auc(two_class,truth = recurrence,estimate = .pred_no )
+
+```
+
+
+
+
+
+
+#save(Prostata_ca_App_data, file="Prostata_ca_App_data.rda")
+
+
+```
+
+## split data
+```{r}
+set.seed(525)
+ca_prostate_split <- dat %>%
+  initial_split(prop = 0.8, strata = Recurrence)
+ca_prostate_train <- training(ca_prostate_split)
+ca_prostate_test <- testing(ca_prostate_split)
+#ready <- ca_prostate_test
+#save(ready, file="ready.rda")
+```
+
+
+## preprocessing
+```{r}
+ca_prostate_recipe <- recipe(Recurrence ~ ., data = ca_prostate_train) %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+ # step_dummy(all_nominal_predictors(),- all_outcomes()) %>% 
+  step_upsample(Recurrence, over_ratio = 1) %>% 
+  step_nzv(all_predictors()) %>% 
+  step_zv(all_predictors()) %>% 
+  #step_corr(all_predictors()) %>%  
+  prep()
+ca_prostate_recipe
+```
+
+
+```{r}
+ca_prostate_train_baked <- bake(ca_prostate_recipe, NULL)
+ca_prostate_test_baked <- bake(ca_prostate_recipe, new_data = ca_prostate_test)
+table(ca_prostate_train_baked$STATUS.x)
+table(ca_prostate_test_baked$STATUS.x)
+
+myplot.train <- ggplot(ca_prostate_train_baked, aes(STATUS.x)) + 
+          geom_bar(aes(y = (..count..)/sum(..count..)),fill= "#56B4E9",color='darkblue') + 
+          scale_y_continuous(labels=scales::percent) +
+   xlab("Recurrence Status") +
+  ylab("relative frequencies")
+
+myplot.train
+
+
+myplot.test <- ggplot(ca_prostate_test_baked, aes(STATUS.x)) + 
+          geom_bar(aes(y = (..count..)/sum(..count..)),fill= "#56B4E9",color='darkblue') + 
+          scale_y_continuous(labels=scales::percent) +
+   xlab("Recurrence Status") +
+  ylab("relative frequencies")
+
+myplot.test
+```
+
+
+
+
+
+
+```{r}
+lassprd1 <- final_lr_fit %>%
+  pluck(".workflow", 1) %>%
+  pull_workflow_fit() 
+
+lassprd <- final_lr_fit %>%
+  pluck(".workflow", 1) %>%
+  pull_workflow_fit() %>% 
+  vip()
+
+lassprd
+
+lassprd$data$Variable
+
+coef(lassprd1$fit,s=1)
+
+length(coef(lassprd$fit,s=1))
+
+
+```
+
+
+```{r}
+
+
+library(DALEX)
+library(DALEXtra)
+
+```
+
+build explainer
+```{r}
+log_reg_trained <- final_lr_wf %>%
+  fit(data = dat)
+
+
+log_reg_explainer <- explain_tidymodels(
+                        model = log_reg_trained,
+                        data = dat %>%
+                          dplyr::select(-Recurrence),
+                        y =dat$Recurrence,
+                        label = "Regularized Logistic Regression")
+
+```
+### Variable Importance Plot
+```{r}
+vimp1 <- model_parts(log_reg_explainer) 
+
+
+class(vimp1)
+
+vimp2 <- vimp1  %>% 
+  filter(dropout_loss>0.09070947)
+
+
+class(vimp2)
+
+plot(vimp1)
+
+
+```
+
+Reference: https://github.com/BriAnsari/NHANES/blob/main/ClassificationModels/nhanes_classification_models.Rmd
+
+
+
+
